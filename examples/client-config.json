@@ -1,13 +1,18 @@
 {
-  "_comment": "Validated front IP (216.239.38.120) and SNI list as of writing — re-run scripts/preflight.sh sweep to refresh.",
+  "listen": "127.0.0.1:8085",
+
+  "_comment_relay": "Choose ONE relay type: 'apps_script' or 'cloudflare_worker'",
+
+  "relay": "apps_script",
+  "script_id": "YOUR_APPS_SCRIPT_DEPLOYMENT_ID",
+
+  "_comment_cf": "For Cloudflare Worker relay, set relay=cloudflare_worker and:",
+  "_worker_url": "https://pmt-relay.your-account.workers.dev",
+
+  "auth_key": "YOUR_SHARED_SECRET_AT_LEAST_16_CHARS",
+
   "front_domain": "www.google.com",
   "front_ip": "216.239.38.120",
-  "front_port": 443,
-  "worker_host": "REPLACE-WITH-YOUR-CLOUD-RUN-HOST.run.app",
-  "tunnel_path": "/tunnel",
-  "auth_key": "REPLACE-WITH-PSK-AT-LEAST-16-BYTES",
-  "listen": "127.0.0.1:8085",
-  "log_level": "info",
-  "insecure_skip_verify": false
-}
 
+  "batch_interval_ms": 100
+}

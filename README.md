@@ -1,269 +1,246 @@
-# PMT-DFC — Persistent Multiplexed Tunnel via Domain-Fronted Cloud Run
+# PMT-DFC — Domain-Fronted Covert Tunnel
 
-A production-grade implementation of the architecture described in
-[`Docs/architecture.md`](Docs/architecture.md): a long-lived, multiplexed
-TCP tunnel where the outer transport is a TLS connection to
-`www.google.com` (SNI fronting) and the inner backend is a
-[Google Cloud Run](https://cloud.google.com/run) service routed by
-HTTP `Host` header. Each tunnel can carry hundreds of concurrent inner
-streams (browser tabs, SSH sessions, etc.) over a single TLS handshake.
+Tunnel network traffic through Google's infrastructure using domain fronting.
+Your firewall sees `www.google.com`; behind the scenes, a free relay (Google Apps Script or Cloudflare Worker) forwards your traffic to a VPS that connects to the real internet.
 
-> **Read this first.** Domain fronting on Google's infrastructure is not
-> officially supported and may stop working at any time. **Always run
-> `pmt-probe` before deploying** to verify that fronting still reaches
-> Cloud Run on your network. If the probe fails, the tunnel will fail —
-> no software change can fix that.
->
-> **AUP risk.** Cloud Run's terms of service prohibit "open proxy"
-> services. Operators who run this should restrict access to known users
-> via the PSK, disable per-request structured logging, and bear in mind
-> that GCP can suspend projects whose traffic patterns look proxy-ish.
-> Use at your own risk.
+```
+Browser / app
+    ↓ SOCKS5 (127.0.0.1:8085)
+pmt-client (your machine)
+    ↓ TLS (SNI = www.google.com, IP = 216.239.38.120)
+    ↓ Host = script.google.com  (inside TLS — firewall can't see this)
+Google Front End
+    ↓ routes by Host header
+Apps Script relay (your free Google account)
+    ↓ UrlFetch → your VPS
+pmt-server (VPS, €4/mo)
+    ↓ real TCP connections
+Internet
+```
 
----
+Two relay options — both free:
 
-## What's in this repo
-
-| Path | Purpose |
-|------|---------|
-| `cmd/server`     | Cloud Run-side endpoint. Accepts authenticated HTTP/2 streaming-POST tunnels, multiplexes with [yamux](https://github.com/hashicorp/yamux), parses SOCKS5 from each inner stream, and dials out. |
-| `cmd/client`     | Local-side endpoint. Exposes a SOCKS5 listener on `127.0.0.1:8085` (or wherever you point browsers at) and forwards each connection over the persistent fronted carrier. |
-| `cmd/probe`      | Standalone tool that verifies SNI=front / Host=worker still reaches your Cloud Run service. Run before deploy and on a periodic basis. |
-| `internal/auth`  | HMAC-SHA256 PSK authentication with timestamp + replay-nonce protection. |
-| `internal/dialer`| TCP+TLS dialer that splits SNI from inner Host. |
-| `internal/tunnel`| Yamux carrier (server handler + auto-reconnecting client). Documents the in-flight-stream-loss semantics on reconnects honestly. |
-| `internal/socks` | Minimal SOCKS5 (RFC 1928) — CONNECT only, DOMAIN/IPv4/IPv6, no auth (the carrier is already authenticated). |
-| `internal/exit`  | Egress dialers. `Direct` (net.Dial) is the only Phase 1 implementation; the `Headless` placeholder documents the Phase 2 chromedp/Playwright design. |
-| `internal/proxy` | Local SOCKS5 listener that forwards bytes to fresh yamux streams. |
-| `internal/cookiejar`, `internal/bulk` | Phase 2/3 stubs (per-`sid` cookie store; GCS bulk-lane offload). Documented but not implemented. |
-| `deploy/`        | `Dockerfile` (distroless), `cloudbuild.yaml`, `deploy.sh`. |
-| `examples/`      | `client-config.json` template. |
-
-## Roadmap (v0 → v1)
-
-| Phase | Status | Notes |
-|-------|--------|-------|
-| **1. Carrier + multiplex + SOCKS5 + direct egress** | **shipped (this PR)** | HTTP/2 streaming POST + yamux + SOCKS5 + `net.Dial`. Auto-reconnect with explicit in-flight stream loss. |
-| 2. Headless-browser exit + per-`sid` cookie jar    | designed, stubbed | For CAPTCHA-protected sites (Cloudflare Turnstile, hCaptcha, DataDome). chromedp pool inside container. |
-| 3. Dual-lane bulk offload via GCS                  | designed, stubbed | Avoids HOL blocking for >1 MiB responses; reduces Cloud Run egress cost. |
-| 4. gRPC bidi-stream alternative carrier            | not started      | More reliable through GFE in some configs; trade-off is a proto-codegen build step. |
-| 5. QUIC / HTTP/3 carrier (probe-gated)             | not started      | Best path latency-wise if UDP/443 is allowed by the firewall. |
-
-Speculative subresource prefetch and connection coalescing across users
-(suggested in §12 of the architecture doc) are intentionally **not on
-the roadmap** — see review notes in the corresponding PR for reasoning.
+| Relay | Cost | Setup | Quota |
+|-------|------|-------|-------|
+| **Google Apps Script** | Free | Deploy Code.gs via browser | 20K calls/day/account (batched) |
+| **Cloudflare Worker** | Free tier | `wrangler deploy` | 100K requests/day |
 
 ---
 
-## Quickstart
+## § 0 — Is this feasible from MY network?
 
-### 0. Is this approach even feasible from MY network?
+Before deploying anything, test whether domain fronting works:
 
-Run **before** spending any time or money on Cloud Run. Two equivalent
-ways — pick whichever runs on the censored machine:
+```powershell
+# Windows (pre-built binary):
+.\pmt-probe.exe --mode=sweep --front-ip=216.239.38.120
 
-**(a) Bash + curl + openssl, no Go required:**
-
-```sh
-# single front, against a pinned IP (recommended on hostile DNS):
-FRONT_IP=216.239.38.120 FRONT=www.google.com bash scripts/preflight.sh
-
-# matrix sweep across all default Google login subdomains on one IP:
+# Linux/Mac:
 FRONT_IP=216.239.38.120 bash scripts/preflight.sh sweep
 ```
 
-**(b) Single Go binary:**
-
-```sh
-make probe
-./bin/pmt-probe --mode=all   --front=www.google.com --front-ip=216.239.38.120
-./bin/pmt-probe --mode=sweep --front-ip=216.239.38.120
-```
-
-Both run the same five-step battery; `sweep` repeats it across many
-SNIs sharing one IP and prints a per-SNI verdict matrix. Neither
-mode requires you to deploy anything to GCP.
-
-| # | Test | What it proves |
-|---|------|---------------|
-| 1 | TCP `443` to the front IP | Your firewall lets you reach Google at all. |
-| 2 | TLS handshake, SNI=front, ALPN=h2 hinted | No TLS MITM by your firewall. |
-| 3 | HTTPS GET `https://<front>/` | The front itself is reachable end-to-end. |
-| 4 | SNI=front, **Host=`clients4.google.com`**, `GET /generate_204` → **204** | GFE still routes by `Host` header across origins. |
-| 5 | SNI=front, **Host=`nonexistent-<rand>-uc.a.run.app`**, `GET /` → **Cloud Run-style 4xx** | GFE will route a fronted request to Cloud Run specifically. |
-
-The default SNI list for `sweep` (validated working through GFE IP
-`216.239.38.120` as of writing — re-run sweep periodically to refresh):
-
-```
-www.google.com           mail.google.com         drive.google.com
-docs.google.com          calendar.google.com     accounts.google.com
-scholar.google.com       maps.google.com         chat.google.com
-translate.google.com     play.google.com         lens.google.com
-chromewebstore.google.com
-```
-
-These subdomains are picked deliberately: they're on Google's login
-critical path (Workspace, Search, Drive), so most filtering stacks
-permit them — blocking them breaks too much legitimate traffic.
-
-If at least one row in the sweep is `FRONTING WORKS`, deploy with
-confidence using that SNI. If all rows are `DO NOT USE` (steps 1–3
-pass but 4 and/or 5 fail), GFE no longer routes fronted traffic for
-that IP — try a different Google IP, or alternate front families
-(`*.appspot.com`, `*.firebaseapp.com`, `*.gstatic.com`, `fonts.googleapis.com`).
-If all rows are `BLOCKED`, your firewall isn't even letting TLS to
-that IP through — switch to a different Google IP.
-
-If nothing works under any combination, domain fronting on Google's
-infrastructure is broken on your network and **no software change in
-this repo can fix that**. Abort and consider non-fronted alternatives
-(Trojan-Go, Xray-VLESS-Reality, hysteria2 on a clean datacenter or
-residential VPS).
-
-### 1. Build the binaries
-
-```sh
-make build
-```
-
-Produces `bin/pmt-server`, `bin/pmt-client`, and `bin/pmt-probe`.
-
-### 2. Probe an actual deployed worker (after step 3)
-
-```sh
-./bin/pmt-probe \
-  --mode=worker \
-  --front www.google.com \
-  --worker your-svc-abc123-uc.a.run.app \
-  --path /healthz
-```
-
-A 200 from `/healthz` proves the full path SNI=front → GFE → your
-Cloud Run service works.
-
-### 3. Deploy the server
-
-See [`Docs/deployment.md`](Docs/deployment.md) for the full guide. TL;DR:
-
-```sh
-PROJECT_ID=my-project \
-REGION=us-central1 \
-SERVICE=pmt-tunnel \
-  ./deploy/deploy.sh
-```
-
-The script:
-* Enables required APIs.
-* Creates an Artifact Registry repo and a Secret Manager entry holding
-  the PSK (it generates one for you on first run — copy it).
-* Builds the image with Cloud Build.
-* Deploys with `--use-http2 --execution-environment=gen2
-  --no-cpu-throttling` and the PSK mounted from Secret Manager.
-
-### 4. Configure and run the client
-
-Copy `examples/client-config.json` to `client.json` (which is
-`.gitignore`d) and fill in the `worker_host` (the Cloud Run hostname
-without the `https://`) and the `auth_key` (the PSK from step 3):
-
-```sh
-cp examples/client-config.json client.json
-$EDITOR client.json
-./bin/pmt-client --config client.json
-```
-
-Now point a SOCKS5 client at `127.0.0.1:8085`. For Firefox:
-
-* Settings → Network Settings → Manual proxy → SOCKS Host
-  `127.0.0.1` Port `8085`, SOCKS v5,
-  **Proxy DNS when using SOCKS v5: ✓** (this is what prevents DNS leaks).
-
-Verify with `curl -x socks5h://127.0.0.1:8085 https://ifconfig.me`. The
-returned IP should be a Google Cloud Run egress IP.
+If at least one SNI row says `FRONTING WORKS`, proceed. If all say `DO NOT USE`, try `--mode=targets` to see which Google product families GFE will route to from your network.
 
 ---
 
-## How the layers compose
+## § 1 — Quick Start
 
-```
- Browser                       Local proxy                       Cloud Run
- ─────────                     ───────────                       ─────────
- SOCKS5 ─┐                                                  ┌─ SOCKS5 parse
-         ├─► yamux stream  ───►  yamux client  ───►  yamux server  ───┤
-         │                                                            │
-         │             one HTTP/2 streaming POST body                 │
-         │  ◄───── chunked HTTP/2 response body  ◄─────────────────── │
-         │                                                            │
-         │       outer TLS, SNI=www.google.com, ALPN=h2               │
-         │                                                            │
- ────────┴────────────────────  GFE / Google IP  ────────────────────┴────
-                                         routes by Host header
-```
+### Prerequisites
+- A cheap VPS (Hetzner CX11 €4/mo, any provider works) — reachable from Google, not from your network
+- A Google account (for Apps Script relay) OR a Cloudflare account (for Worker relay)
+- Go 1.25+ to build from source, OR use pre-built binaries from Releases
 
-* **One TLS handshake** per (user, server) pair.
-* **One HTTP/2 connection** per TLS handshake.
-* **One yamux session** per HTTP/2 connection.
-* **N yamux streams** per session — one per browser tab / DNS lookup /
-  inner connection.
+### Step 1: Deploy the VPS tunnel-node
 
-## Reconnect semantics (read this)
+```bash
+# SSH into your VPS, then:
+git clone https://github.com/easyfast2008/PMT-DFC.git
+cd PMT-DFC
 
-When the carrier breaks (GFE idle timeout ~5 min, Cloud Run instance
-roll, network blip), the client redials transparently. **Yamux streams
-that were in flight at the moment of the break are NOT resumed** —
-their callers get `io.EOF`, just like any TCP reset. This is
-intentional; resuming SOCKS5 / raw TCP across a new carrier is not
-possible without protocol-level support that neither offers. The next
-request opens a fresh stream over the new carrier.
+# Generate a strong auth key:
+AUTH_KEY=$(openssl rand -hex 24)
+echo "Your auth key: $AUTH_KEY"
 
-If you need bulletproof long-running uploads, run them inside an
-application that already handles connection resets (e.g. `rsync`, an
-S3 multipart client, an SSH `mosh`-style overlay).
+# Option A: Docker (recommended)
+docker build -f deploy/Dockerfile -t pmt-server .
+docker run -d --name pmt-server --restart unless-stopped \
+  -p 8080:8080 -e PMT_AUTH_KEY="$AUTH_KEY" pmt-server
 
-## Authentication
+# Option B: Direct binary
+make server
+PMT_AUTH_KEY="$AUTH_KEY" ./bin/pmt-server
 
-* PSK shared between server (`PMT_AUTH_KEY` env var) and client
-  (`auth_key` in config).
-* Each new carrier sends `Authorization: PMT <token>` where
-  `token = base64( ts || nonce || HMAC-SHA256(psk, ts || nonce) )`.
-* Server enforces ±60s clock skew and rejects replayed nonces from a
-  bounded LRU.
-* Rotation: change the secret in Secret Manager and redeploy. Clients
-  using the old PSK will get 401 on next reconnect.
-
-A future revision can swap this for mTLS or signed JWTs without
-changing the carrier shape.
-
-## Security and operations
-
-* The server image is `distroless/static-debian12:nonroot` — no shell,
-  no package manager, no setuid bits.
-* The server keeps response bodies open for the lifetime of the
-  carrier. Cloud Run Gen2 supports up to 60-minute requests; the
-  server emits an application-level keepalive every 30s by default.
-* Per-request structured logging is **off** for tunnel data — the
-  server only logs auth failures, dial failures, and lifecycle events.
-  This is a deliberate decision so that user traffic patterns are not
-  written to Stackdriver.
-* `min-instances=1` is the default in `deploy.sh`. This costs ~$5–15/mo
-  baseline (more with Always-On CPU), in exchange for predictable
-  latency. Set it to 0 if you can tolerate cold starts.
-
-## Testing
-
-```sh
-go test ./...
+# Option C: One-shot install script
+bash deploy/install-vps.sh "$AUTH_KEY"
 ```
 
-The test suite covers:
+Verify: `curl http://localhost:8080/health` → `ok`
 
-* `internal/auth`    — token sign/verify, replay rejection, skew, eviction.
-* `internal/socks`   — RFC 1928 handshake parser, edge cases, error codes.
-* `internal/tunnel`  — full HTTP/2-streaming-POST + yamux + SOCKS5 +
-  echo egress integration through both a raw HTTP server and the real
-  `tunnel.Client` on TLS.
+### Step 2: Deploy the relay (choose one)
+
+#### Option A: Google Apps Script (recommended — zero cost, proven)
+
+1. Open https://script.google.com, sign in, create a new project.
+2. Delete the default code and paste the contents of [`relay/apps-script/Code.gs`](relay/apps-script/Code.gs).
+3. Edit `TUNNEL_SERVER_URL` → `http://YOUR_VPS_IP:8080`
+4. Edit `AUTH_KEY` → the same key from Step 1.
+5. **Deploy → New deployment → Web app** → Execute as: Me, Access: Anyone.
+6. Copy the **Deployment ID** (long random string in the deployment URL).
+
+#### Option B: Cloudflare Worker (alternative — also free)
+
+```bash
+cd relay/cloudflare-worker
+# Edit wrangler.toml: set TUNNEL_SERVER_URL and AUTH_KEY
+npm install -g wrangler
+wrangler login
+wrangler deploy
+# Note your Worker URL: https://pmt-relay.YOUR-ACCOUNT.workers.dev
+```
+
+### Step 3: Configure the client
+
+Create `client.json`:
+
+```json
+{
+  "listen": "127.0.0.1:8085",
+  "relay": "apps_script",
+  "script_id": "YOUR_DEPLOYMENT_ID_FROM_STEP_2",
+  "auth_key": "YOUR_AUTH_KEY_FROM_STEP_1",
+  "front_domain": "www.google.com",
+  "front_ip": "216.239.38.120"
+}
+```
+
+For Cloudflare Worker relay instead:
+
+```json
+{
+  "listen": "127.0.0.1:8085",
+  "relay": "cloudflare_worker",
+  "worker_url": "https://pmt-relay.YOUR-ACCOUNT.workers.dev",
+  "auth_key": "YOUR_AUTH_KEY_FROM_STEP_1",
+  "front_domain": "www.google.com",
+  "front_ip": "216.239.38.120"
+}
+```
+
+### Step 4: Run the client
+
+```bash
+make client
+./bin/pmt-client --config client.json
+```
+
+### Step 5: Use it
+
+Set your browser's SOCKS5 proxy to `127.0.0.1:8085`. Or test with curl:
+
+```bash
+curl --proxy socks5h://127.0.0.1:8085 https://ifconfig.me
+```
+
+---
+
+## § 2 — Architecture
+
+### Data flow
+
+```
+Client (censored network)
+  │
+  │ SOCKS5 connection from browser
+  ↓
+pmt-client
+  │ Parses SOCKS5 handshake, extracts target host:port
+  │ Batches multiple sessions into one JSON request
+  │ Sends via fronted TLS (SNI=www.google.com) to relay
+  ↓
+Google Front End / Cloudflare Edge
+  │ Routes by HTTP Host header
+  ↓
+Relay (Apps Script or CF Worker)
+  │ Forwards JSON payload to VPS via UrlFetch / fetch()
+  ↓
+pmt-server (VPS tunnel-node)
+  │ Manages persistent TCP sessions to real targets
+  │ Returns response data in JSON batch
+  ↓
+Real Internet
+```
+
+### Batch protocol
+
+```
+POST /tunnel/batch
+{
+  "k": "auth_key",
+  "ops": [
+    {"op": "connect", "sid": "abc123", "host": "example.com", "port": 443},
+    {"op": "data",    "sid": "def456", "d": "base64..."},
+    {"op": "close",   "sid": "ghi789"}
+  ]
+}
+→ {
+  "r": [
+    {"sid": "abc123", "d": "base64-initial-response..."},
+    {"sid": "def456", "d": "base64-response-data..."},
+    {"sid": "ghi789", "eof": true}
+  ]
+}
+```
+
+Wire-compatible with [MhR's tunnel-node](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/tree/main/tunnel-node) batch format.
+
+### Why two relay options?
+
+| | Apps Script | Cloudflare Worker |
+|---|---|---|
+| Works from Iran? | Yes (proven) | Needs testing |
+| Setup | Browser only, no CLI | `wrangler deploy` |
+| Cost | Free | Free tier (100K req/day) |
+| Latency | ~2-5s round-trip | ~0.5-2s round-trip |
+| Quota | 20K UrlFetch/day/account | 100K requests/day |
+| Scale | Multiple Google accounts | Paid plan ($5/mo) |
+
+---
+
+## § 3 — Preflight Probe
+
+The `pmt-probe` tool tests whether domain fronting works from your network:
+
+```bash
+# Full 5-step battery for one SNI:
+./bin/pmt-probe --mode=all --front=www.google.com --front-ip=216.239.38.120
+
+# Sweep all 13 known-working Google SNIs:
+./bin/pmt-probe --mode=sweep --front-ip=216.239.38.120
+
+# Test which Google product families GFE will route to:
+./bin/pmt-probe --mode=targets --front-ip=216.239.38.120
+```
+
+---
+
+## § 4 — Phase 2 Roadmap (planned)
+
+- **Per-session cookie jar** on VPS — persistent cookies across requests within a session
+- **curl_cffi integration** — JA3/JA4 fingerprint impersonation for anti-bot bypass
+- **Headless Chromium pool** — CAPTCHA solver for JS-challenge sites
+- **Google Drive bulk lane** — high-throughput path via Drive API for large downloads (FlowDriver pattern)
+- **Multi-deployment pipelining** — multiple Apps Script deployments for higher concurrency
+
+---
+
+## § 5 — Credits
+
+- [MasterHttpRelayVPN](https://github.com/masterking32/MasterHttpRelayVPN) by @masterking32 — original Apps Script relay concept
+- [MasterHttpRelayVPN-RUST](https://github.com/therealaleph/MasterHttpRelayVPN-RUST) by @therealaleph — Rust port with batch tunnel-node
+- [FlowDriver](https://github.com/NullLatency/FlowDriver) by @NullLatency — Google Drive as covert transport
+
+---
 
 ## License
 
-MIT. See [`LICENSE`](LICENSE).
+MIT. See [LICENSE](LICENSE).

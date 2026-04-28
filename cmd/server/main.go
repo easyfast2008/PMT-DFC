@@ -1,152 +1,151 @@
-// Command pmt-server is the Cloud Run-side endpoint of the tunnel.
+// Command pmt-server is the VPS tunnel-node.
 //
-// It accepts HTTP/2 streaming POST requests on /tunnel, authenticates
-// them, multiplexes the body using yamux, and treats each accepted yamux
-// stream as a SOCKS5 inner connection that it dials out from the Cloud Run
-// container.
+// It accepts batch JSON requests at POST /tunnel/batch, manages persistent
+// TCP sessions to upstream targets, and returns responses. Designed to sit
+// behind a relay (Apps Script or Cloudflare Worker) that forwards fronted
+// requests from censored clients.
 //
-// Flags / env:
+// Protocol is wire-compatible with MhR's tunnel-node batch format.
 //
-//	PORT          (Cloud Run-provided) listen port. Default 8080.
-//	PMT_AUTH_KEY  (required) PSK shared with clients. Min 16 bytes.
-//	PMT_LOG_LEVEL info|debug. Default info.
+// Env:
+//
+//	PORT             listen port (default 8080)
+//	PMT_AUTH_KEY     shared secret (required, min 16 bytes)
 package main
 
 import (
 	"context"
-	"errors"
+	"encoding/json"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"os"
 	"os/signal"
-	"sync"
 	"syscall"
 	"time"
 
-	"github.com/easyfast2008/PMT-DFC/internal/auth"
-	"github.com/easyfast2008/PMT-DFC/internal/exit"
-	"github.com/easyfast2008/PMT-DFC/internal/socks"
 	"github.com/easyfast2008/PMT-DFC/internal/tunnel"
-	"github.com/hashicorp/yamux"
-	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/h2c"
 )
 
 func main() {
-	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{
-		Level: levelFromEnv(),
-	}))
-	slog.SetDefault(logger)
-
-	psk := os.Getenv("PMT_AUTH_KEY")
-	if len(psk) < 16 {
-		logger.Error("PMT_AUTH_KEY must be set and at least 16 bytes")
-		os.Exit(2)
+	level := slog.LevelInfo
+	if os.Getenv("PMT_LOG_LEVEL") == "debug" {
+		level = slog.LevelDebug
 	}
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
+
+	authKey := os.Getenv("PMT_AUTH_KEY")
+	if len(authKey) < 16 {
+		log.Error("PMT_AUTH_KEY must be at least 16 characters")
+		os.Exit(1)
+	}
+
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
 
-	verifier := auth.NewVerifier([]byte(psk), 200_000)
-	dialer := exit.NewDirect()
-
-	streamHandler := func(stream *yamux.Stream) {
-		handleStream(context.Background(), stream, dialer, logger)
-	}
+	sm := tunnel.NewSessionManager(120 * time.Second)
 
 	mux := http.NewServeMux()
-	mux.Handle("/tunnel", tunnel.ServerHandler(verifier, streamHandler))
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = io.WriteString(w, "ok")
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = w.Write([]byte("ok"))
 	})
+	mux.HandleFunc("POST /tunnel/batch", batchHandler(log, authKey, sm))
+	// Legacy single-op endpoint for compatibility.
+	mux.HandleFunc("POST /tunnel", batchHandler(log, authKey, sm))
 
-	h2s := &http2.Server{
-		MaxConcurrentStreams: 1024,
-		IdleTimeout:          0, // we keep the carrier open ourselves
-	}
 	srv := &http.Server{
 		Addr:              ":" + port,
-		Handler:           h2c.NewHandler(mux, h2s),
+		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
-		// Read/Write timeouts MUST be 0 — the tunnel is long-lived.
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	// Session reaper.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	go func() {
-		<-ctx.Done()
-		shCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = srv.Shutdown(shCtx)
+		t := time.NewTicker(30 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				if n := sm.ReapIdle(); n > 0 {
+					log.Info("reaped idle sessions", "count", n)
+				}
+				log.Debug("sessions", "active", sm.Count())
+			}
+		}
 	}()
 
-	logger.Info("pmt-server listening", "addr", srv.Addr)
-	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		logger.Error("server failed", "err", err)
+	go func() {
+		<-ctx.Done()
+		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutCtx)
+	}()
+
+	log.Info("pmt-server listening", "port", port, "sessions_idle_timeout", "120s")
+	if err := srv.ListenAndServe(); err != http.ErrServerClosed {
+		log.Error("server error", "err", err)
 		os.Exit(1)
 	}
 }
 
-func levelFromEnv() slog.Level {
-	switch os.Getenv("PMT_LOG_LEVEL") {
-	case "debug":
-		return slog.LevelDebug
-	case "warn":
-		return slog.LevelWarn
-	case "error":
-		return slog.LevelError
-	default:
-		return slog.LevelInfo
-	}
-}
+func batchHandler(log *slog.Logger, authKey string, sm *tunnel.SessionManager) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(io.LimitReader(r.Body, 8<<20))
+		if err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		defer r.Body.Close()
 
-func handleStream(ctx context.Context, stream *yamux.Stream, dialer exit.Dialer, log *slog.Logger) {
-	defer stream.Close()
-	req, err := socks.ServeHandshake(stream)
-	if err != nil {
-		log.Debug("socks handshake failed", "err", err)
-		return
-	}
-	dialCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	target, err := dialer.DialContext(dialCtx, req.Addr)
-	if err != nil {
-		_ = socks.WriteReply(stream, socks.CodeFromError(err))
-		log.Debug("egress dial failed", "addr", req.Addr, "err", err)
-		return
-	}
-	if err := socks.WriteReply(stream, socks.ReplySuccess); err != nil {
-		_ = target.Close()
-		return
-	}
-	splice(stream, target)
-}
+		var req tunnel.BatchRequest
+		if err := json.Unmarshal(body, &req); err != nil {
+			http.Error(w, "invalid json", http.StatusBadRequest)
+			return
+		}
 
-func splice(a, b net.Conn) {
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		_, _ = io.Copy(a, b)
-		halfClose(a)
-	}()
-	go func() {
-		defer wg.Done()
-		_, _ = io.Copy(b, a)
-		halfClose(b)
-	}()
-	wg.Wait()
-	_ = a.Close()
-	_ = b.Close()
-}
+		if req.Key != authKey {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
 
-func halfClose(c net.Conn) {
-	type cw interface{ CloseWrite() error }
-	if x, ok := c.(cw); ok {
-		_ = x.CloseWrite()
+		log.Debug("batch", "ops", len(req.Ops))
+		results := sm.ProcessBatch(req.Ops)
+
+		// Collect SIDs that had data ops for drain phase.
+		var dataSIDs []string
+		hasWrites := false
+		for _, op := range req.Ops {
+			if op.Op == "data" || op.Op == "connect" {
+				dataSIDs = append(dataSIDs, op.SID)
+				if op.Data != "" {
+					hasWrites = true
+				}
+			}
+		}
+
+		// If there were writes, give upstream servers time to respond.
+		if hasWrites && len(dataSIDs) > 0 {
+			extra := sm.DrainAll(dataSIDs, 200*time.Millisecond)
+			for i, result := range results {
+				if data, ok := extra[result.SID]; ok && len(data) > 0 {
+					existing, _ := tunnel.DecodeData(results[i].Data)
+					existing = append(existing, data...)
+					results[i].Data = tunnel.EncodeData(existing)
+				}
+			}
+		}
+
+		resp := tunnel.BatchResponse{Results: results}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
 	}
 }

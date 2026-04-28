@@ -38,6 +38,10 @@ type Config struct {
 	// HandshakeTimeout bounds the TLS handshake.
 	HandshakeTimeout time.Duration
 
+	// PreferH1 advertises HTTP/1.1 before h2 in ALPN. Useful for relays
+	// where h2 multiplexing is handled at a higher layer.
+	PreferH1 bool
+
 	// InsecureSkipVerify disables certificate verification.
 	// Only useful for local testing — never set in production.
 	InsecureSkipVerify bool
@@ -83,9 +87,13 @@ func (d *Dialer) DialContext(ctx context.Context) (*tls.Conn, error) {
 		return nil, fmt.Errorf("dialer: tcp dial %s: %w", addr, err)
 	}
 
+	protos := []string{"h2", "http/1.1"}
+	if d.cfg.PreferH1 {
+		protos = []string{"http/1.1", "h2"}
+	}
 	tlsCfg := &tls.Config{
 		ServerName:         d.cfg.FrontDomain,
-		NextProtos:         []string{"h2"},
+		NextProtos:         protos,
 		MinVersion:         tls.VersionTLS12,
 		InsecureSkipVerify: d.cfg.InsecureSkipVerify, //nolint:gosec // documented test escape hatch
 	}
@@ -100,9 +108,10 @@ func (d *Dialer) DialContext(ctx context.Context) (*tls.Conn, error) {
 		_ = rawConn.Close()
 		return nil, fmt.Errorf("dialer: tls handshake: %w", err)
 	}
-	if got := tlsConn.ConnectionState().NegotiatedProtocol; got != "h2" {
+	got := tlsConn.ConnectionState().NegotiatedProtocol
+	if got != "h2" && got != "http/1.1" && got != "" {
 		_ = tlsConn.Close()
-		return nil, fmt.Errorf("dialer: ALPN negotiated %q, want h2", got)
+		return nil, fmt.Errorf("dialer: ALPN negotiated %q, want h2 or http/1.1", got)
 	}
 	return tlsConn, nil
 }

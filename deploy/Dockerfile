@@ -1,29 +1,22 @@
-# syntax=docker/dockerfile:1.6
+# PMT-DFC VPS tunnel-node Docker image.
+#
+# Build:
+#   docker build -t pmt-server -f deploy/Dockerfile .
+#
+# Run:
+#   docker run -d --name pmt-server \
+#     -p 8080:8080 \
+#     -e PMT_AUTH_KEY=your-secret-key-here \
+#     pmt-server
 
-# ---------- build stage ----------
-FROM golang:1.25-alpine AS build
-
+FROM golang:1.25-alpine AS builder
 WORKDIR /src
-
-# Cache deps
 COPY go.mod go.sum ./
 RUN go mod download
-
-# Build
 COPY . .
-ARG TARGETOS=linux
-ARG TARGETARCH=amd64
-ENV CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH}
-RUN go build -trimpath -ldflags="-s -w" -o /out/pmt-server ./cmd/server
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /pmt-server ./cmd/server
 
-# ---------- runtime stage ----------
 FROM gcr.io/distroless/static-debian12:nonroot
-
-COPY --from=build /out/pmt-server /pmt-server
-
-# Cloud Run sets PORT; we default to 8080 for local runs.
-ENV PORT=8080
+COPY --from=builder /pmt-server /pmt-server
 EXPOSE 8080
-
-USER nonroot:nonroot
 ENTRYPOINT ["/pmt-server"]
