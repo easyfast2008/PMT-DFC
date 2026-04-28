@@ -1,0 +1,18 @@
+{
+  "listen": "127.0.0.1:8085",
+
+  "_comment_relay": "Choose ONE relay type: 'apps_script' or 'cloudflare_worker'",
+
+  "relay": "apps_script",
+  "script_id": "YOUR_APPS_SCRIPT_DEPLOYMENT_ID",
+
+  "_comment_cf": "For Cloudflare Worker relay, set relay=cloudflare_worker and:",
+  "_worker_url": "https://pmt-relay.your-account.workers.dev",
+
+  "auth_key": "YOUR_SHARED_SECRET_AT_LEAST_16_CHARS",
+
+  "front_domain": "www.google.com",
+  "front_ip": "216.239.38.120",
+
+  "batch_interval_ms": 100
+}
