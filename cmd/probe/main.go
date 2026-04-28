@@ -58,6 +58,12 @@ Modes:
   all        Runs tcp → tls → front → cross → runapp for one --front.
   sweep      Same as all, but iterates over multiple --front values
              (comma-separated via --fronts=a,b,c). Prints a matrix.
+  targets    Probes whether GFE will route fronted requests to each Google
+             L7 product family (Cloud Run, App Engine, Cloud Functions,
+             Firebase Hosting, googleusercontent, googleapis). Classifies
+             each response as ROUTED / BLOCKED-GEO / NOT-FOUND / INTERCEPTED.
+             Use this when --mode=runapp returns 403 — to find a sibling
+             product GFE will route to instead.
   worker     Probes a real deployed worker (--worker host required).
 
 Examples:
@@ -91,7 +97,7 @@ var defaultSweepFronts = []string{
 }
 
 func main() {
-	mode := flag.String("mode", "all", "tcp|tls|front|cross|runapp|worker|all|sweep")
+	mode := flag.String("mode", "all", "tcp|tls|front|cross|runapp|worker|all|sweep|targets")
 	front := flag.String("front", "www.google.com", "front domain (SNI)")
 	fronts := flag.String("fronts", "", "comma-separated SNIs for mode=sweep (default: built-in list)")
 	frontIP := flag.String("front-ip", "", "fixed IP for the front (skip DNS); recommended on censored networks")
@@ -146,6 +152,37 @@ func main() {
 			return testRunApp(*front, *frontIP, *frontPort, host, *timeout)
 		})
 		if any {
+			code = exitInterc
+		}
+	case "targets":
+		var rb [6]byte
+		_, _ = rand.Read(rb[:])
+		nonce := hex.EncodeToString(rb[:])
+		fmt.Printf("---- target sweep via %s (front_ip=%s) ----\n\n", *front, *frontIP)
+		fmt.Printf("%-44s  %-3s  %-12s  %s\n", "product / Host", "code", "verdict", "server")
+		fmt.Printf("%-44s  %-3s  %-12s  %s\n", strings.Repeat("-", 44), "----", "------------", "------")
+		anyRoutable := false
+		for _, t := range defaultTargets {
+			h := t.host(nonce)
+			status, server, verdict, err := fetchTargetVerdict(*front, *frontIP, *frontPort, h, *timeout)
+			label := t.product
+			if len(label) > 44 {
+				label = label[:41] + "..."
+			}
+			if err != nil {
+				fmt.Printf("%-44s  %-3s  %-12s  err: %v\n", label, "---", "-", err)
+				continue
+			}
+			fmt.Printf("%-44s  %-3d  %-12s  %s\n", label, status, verdict, server)
+			if verdict == verdictRouted || verdict == verdictNotFound {
+				anyRoutable = true
+			}
+		}
+		fmt.Println()
+		if anyRoutable {
+			fmt.Println("at least one product family is reachable from this network — pick one and re-target the server side accordingly.")
+		} else {
+			fmt.Println("every product family was BLOCKED-GEO or INTERCEPTED — Google L7 fronting is dead from this network.")
 			code = exitInterc
 		}
 	case "sweep":
@@ -406,6 +443,153 @@ func randomRunApp() string {
 	_, _ = rand.Read(b[:])
 	// `*-uc.a.run.app` is a real Cloud Run hostname pattern that resolves on GFE.
 	return fmt.Sprintf("nonexistent-%s-uc.a.run.app", hex.EncodeToString(b[:]))
+}
+
+// targetSpec is one Google L7 backend product hostname pattern that we
+// can probe with a fronted request to see whether GFE will route to it
+// from this network. The hostname is constructed at probe time so it
+// definitely doesn't exist — we only care whether GFE *would* route the
+// request, not whether the backend serves anything.
+type targetSpec struct {
+	product string                 // human label
+	host    func(rand string) string // build the Host header
+}
+
+var defaultTargets = []targetSpec{
+	{"Cloud Run (run.app)", func(r string) string { return fmt.Sprintf("nonexistent-%s-uc.a.run.app", r) }},
+	{"App Engine (appspot.com)", func(r string) string { return fmt.Sprintf("nonexistent-%s.appspot.com", r) }},
+	{"App Engine versioned (uc.r.appspot.com)", func(r string) string { return fmt.Sprintf("nonexistent-%s.uc.r.appspot.com", r) }},
+	{"Cloud Functions Gen1 (cloudfunctions.net)", func(r string) string { return fmt.Sprintf("us-central1-nonexistent-%s.cloudfunctions.net", r) }},
+	{"Firebase Hosting (web.app)", func(r string) string { return fmt.Sprintf("nonexistent-%s.web.app", r) }},
+	{"Firebase Hosting (firebaseapp.com)", func(r string) string { return fmt.Sprintf("nonexistent-%s.firebaseapp.com", r) }},
+	{"Google user content (googleusercontent.com)", func(r string) string { return fmt.Sprintf("nonexistent-%s.googleusercontent.com", r) }},
+	{"Google APIs frontend (storage.googleapis.com)", func(_ string) string { return "storage.googleapis.com" }},
+	{"Google APIs frontend (maps.googleapis.com)", func(_ string) string { return "maps.googleapis.com" }},
+}
+
+// targetVerdict classifies the response from a fronted GET against an
+// L7 product hostname.
+type targetVerdict string
+
+const (
+	verdictRouted     targetVerdict = "ROUTED"      // backend (or its load balancer) responded — fronting works
+	verdictBlockedGeo targetVerdict = "BLOCKED-GEO" // GFE refused with the generic "your client does not have permission" 403
+	verdictNotFound   targetVerdict = "NOT-FOUND"   // GFE returned generic 404 — no service registered, but routing path not blocked
+	verdictIntercept  targetVerdict = "INTERCEPTED" // GFE served the front HTML — Host header was ignored
+	verdictUnknown    targetVerdict = "UNKNOWN"     // anything else
+)
+
+// classifyTargetResp inspects a fronted response and returns a verdict.
+// Heuristics:
+//   - If status==200 AND body contains the front domain text → INTERCEPTED.
+//   - If status==403 AND body contains the generic "your client does not have
+//     permission" / "Forbidden" robot-page text → BLOCKED-GEO.
+//   - If status==404 AND body contains "Page not found" / "The requested URL"
+//     and there's no backend-specific marker → NOT-FOUND.
+//   - If body or server header has any backend-shaped marker (Cloud Run,
+//     App Engine, Cloud Functions, Firebase, GCS, etc.) → ROUTED.
+//   - Otherwise → UNKNOWN.
+func classifyTargetResp(front string, status int, body []byte, server string) targetVerdict {
+	bl := strings.ToLower(string(body))
+	sv := strings.ToLower(server)
+	frontL := strings.ToLower(front)
+
+	// 1. Definitive BLOCKED-GEO: the generic "Error 403 (Forbidden)!!1" robot
+	//    page Google serves when it refuses to route a request. The body always
+	//    contains "permission to get URL" — that's the load-bearing string.
+	if strings.Contains(bl, "permission to get url") ||
+		strings.Contains(bl, "your client does not have permission") {
+		return verdictBlockedGeo
+	}
+
+	// 2. Definitive INTERCEPT: GFE served the front itself instead of routing.
+	if status == 200 && strings.Contains(bl, frontL) && len(bl) > 1000 {
+		return verdictIntercept
+	}
+
+	// 3. Backend-shaped server header → ROUTED. These are Google internal
+	//    frontend identifiers: gws, sffe (static content), ESF (encrypted
+	//    storage), GSE, scaffolding on HTTPServer (App Engine), UploadServer
+	//    (GCS), Google Frontend, etc. Generic GFE block pages have NO server
+	//    header at all, so a non-empty server with one of these markers means
+	//    the request reached a real backend.
+	backendServerMarkers := []string{
+		"google frontend", "scaffolding", "httpserver",
+		"uploadserver", "sffe", "gse", "esf", "gws",
+	}
+	for _, m := range backendServerMarkers {
+		if strings.Contains(sv, m) {
+			return verdictRouted
+		}
+	}
+
+	// 4. Body markers naming the product → ROUTED.
+	backendBodyMarkers := []string{
+		"cloud run", "run.app",
+		"google app engine", "appspot",
+		"cloud functions",
+		"firebase",
+		"cloud storage", "googleapis",
+	}
+	for _, m := range backendBodyMarkers {
+		if strings.Contains(bl, m) {
+			return verdictRouted
+		}
+	}
+
+	// 5. Generic GFE 404: "Error: Page not found" / "The requested URL was not
+	//    found on this server." These come from GFE itself when no backend is
+	//    registered at the Host. NOT a hard block — a real service would
+	//    receive the request — so treat as routing-permitted.
+	if status == 404 && (strings.Contains(bl, "page not found") ||
+		strings.Contains(bl, "requested url was not found")) {
+		return verdictNotFound
+	}
+
+	// 6. Fall-through. Treat 403 + "forbidden" body as BLOCKED-GEO too (less
+	//    specific than rule 1 but catches abbreviated variants).
+	if status == 403 && strings.Contains(bl, "forbidden") {
+		return verdictBlockedGeo
+	}
+
+	return verdictUnknown
+}
+
+// fetchTargetVerdict makes one fronted GET and classifies the response.
+func fetchTargetVerdict(front, frontIP string, port int, hostHeader string, timeout time.Duration) (int, string, targetVerdict, error) {
+	d, err := dialer.New(dialer.Config{FrontDomain: front, FrontIP: frontIP, Port: port, HandshakeTimeout: timeout})
+	if err != nil {
+		return 0, "", verdictUnknown, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	tc, err := d.DialContext(ctx)
+	if err != nil {
+		return 0, "", verdictUnknown, err
+	}
+	defer tc.Close()
+	tr := &http2.Transport{
+		DialTLSContext: func(_ context.Context, _, _ string, _ *tls.Config) (net.Conn, error) {
+			return nil, errors.New("unexpected dial")
+		},
+	}
+	cc, err := tr.NewClientConn(tc)
+	if err != nil {
+		return 0, "", verdictUnknown, err
+	}
+	u := &url.URL{Scheme: "https", Host: hostHeader, Path: "/"}
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	req.Host = hostHeader
+	req.Header.Set("User-Agent", "pmt-probe/0.1")
+	resp, err := cc.RoundTrip(req)
+	if err != nil {
+		return 0, "", verdictUnknown, err
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<14))
+	_ = resp.Body.Close()
+	server := resp.Header.Get("Server")
+	v := classifyTargetResp(front, resp.StatusCode, body, server)
+	return resp.StatusCode, server, v, nil
 }
 
 func looksGoogleCert(s string, issuer string) bool {
