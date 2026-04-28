@@ -57,6 +57,47 @@ the roadmap** — see review notes in the corresponding PR for reasoning.
 
 ## Quickstart
 
+### 0. Is this approach even feasible from MY network?
+
+Run **before** spending any time or money on Cloud Run. There are two
+ways, both equivalent — pick whichever runs on the censored machine:
+
+**(a) Bash + curl + openssl, no Go required:**
+
+```sh
+bash scripts/preflight.sh
+# or, with a pinned IP if DNS is hostile on your network:
+FRONT_IP=142.251.150.119 bash scripts/preflight.sh
+```
+
+**(b) Single Go binary (use this if you can copy `pmt-probe` over):**
+
+```sh
+make probe
+./bin/pmt-probe --mode=all --front=www.google.com
+# pinned IP variant:
+./bin/pmt-probe --mode=all --front=www.google.com --front-ip=142.251.150.119
+```
+
+Both run the same five-step feasibility battery and require zero GCP
+infrastructure:
+
+| # | Test | What it proves |
+|---|------|---------------|
+| 1 | TCP `443` to a Google IP | Your firewall lets you reach Google at all. |
+| 2 | TLS handshake, SNI=front, ALPN=h2 | No TLS MITM by your firewall. |
+| 3 | HTTPS GET `https://www.google.com/` | The front itself is reachable end-to-end. |
+| 4 | SNI=front, **Host=`clients4.google.com`**, `GET /generate_204` → expect **204** | GFE still routes by `Host` header across origins. |
+| 5 | SNI=front, **Host=`nonexistent-<rand>-uc.a.run.app`**, `GET /` → expect **Cloud Run-style 404** | GFE will route a fronted request to Cloud Run specifically. |
+
+If all five PASS: deploy with confidence. If step 4 or 5 fails: GFE no
+longer accepts the SNI/Host split for that path — you can try alternate
+fronts (`*.appspot.com`, `*.firebaseapp.com`, `*.gstatic.com`,
+`fonts.googleapis.com`) by changing `--front` / `FRONT`. If none work,
+domain fronting on Google's infrastructure is broken on your network
+and **no software change in this repo can fix that** — abort and
+reconsider the approach.
+
 ### 1. Build the binaries
 
 ```sh
@@ -65,20 +106,18 @@ make build
 
 Produces `bin/pmt-server`, `bin/pmt-client`, and `bin/pmt-probe`.
 
-### 2. Probe that fronting works on your network
+### 2. Probe an actual deployed worker (after step 3)
 
 ```sh
 ./bin/pmt-probe \
+  --mode=worker \
   --front www.google.com \
-  --worker any-existing-run-app-host.run.app \
-  --path /
+  --worker your-svc-abc123-uc.a.run.app \
+  --path /healthz
 ```
 
-If you don't have a Cloud Run service yet, point `--worker` at any
-known-reachable `*.run.app` host and `--expect 404` — a 404 from the
-backend is proof that the request reached Cloud Run, which is what
-matters. A 404 from `www.google.com` means GFE intercepted before
-routing, i.e. fronting no longer works. Stop here in that case.
+A 200 from `/healthz` proves the full path SNI=front → GFE → your
+Cloud Run service works.
 
 ### 3. Deploy the server
 

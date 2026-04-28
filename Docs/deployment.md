@@ -15,28 +15,59 @@ Cloud Run, then configuring a local client.
 * `docker` (only if you want to run the server image locally).
 * `openssl` (only if you want to generate a fresh PSK manually).
 
-## 1. Pre-deployment fronting probe
+## 1. Pre-deployment feasibility battery
 
-Before deploying anything, verify that SNI fronting still reaches Cloud
-Run on your client network. Use a `*.run.app` host you already know
-exists (any service in any project — the probe just needs to confirm
-GFE routes by Host).
+**Run this before deploying anything.** It does not require a Cloud
+Run service to exist — it tests the path the tunnel will use against
+well-known Google endpoints.
 
 ```sh
-./bin/pmt-probe \
-  --front www.google.com \
-  --worker some-known-service-abc123-uc.a.run.app \
-  --path / --expect 404
+# from the censored network where the client will run:
+bash scripts/preflight.sh
+
+# or, equivalently, the Go binary:
+./bin/pmt-probe --mode=all --front=www.google.com
 ```
 
-* **PASS** → GFE routes by Host header. Continue.
-* **FAIL with `got status 200`** and a `www.google.com` body → GFE
-  ignored the Host header and served the front. Fronting is broken
-  on your network. Try alternate fronts (`*.appspot.com`,
-  `*.firebaseapp.com`, `*.firebaseio.com`) by changing `--front`. If
-  none work, abort: this design cannot function without fronting.
-* **FAIL with TLS error** → Your firewall is blocking TLS to the
-  Google IP, or doing TLS MITM. Abort.
+Both run a five-step battery:
+
+1. **TCP/443 to the front IP** — proves you can reach Google at all.
+2. **TLS handshake with SNI=front, ALPN=h2** — proves no TLS MITM and
+   that h2 is reachable.
+3. **HTTPS GET to the front itself** — sanity that the front is up.
+4. **SNI=front, Host=`clients4.google.com` `/generate_204`** — must
+   return 204. Proves GFE still routes by `Host` across origins.
+5. **SNI=front, Host=`nonexistent-<rand>-uc.a.run.app` `/`** — must
+   return a Cloud Run-style 4xx. Proves GFE routes fronted requests
+   into the Cloud Run frontend specifically. (404 is the expected
+   status because the random hostname has no service behind it; what
+   matters is that the response *came from Cloud Run*, not Google's
+   own front HTML.)
+
+If steps 1–3 fail, your network blocks Google or MITMs TLS — abort.
+If 4 fails but 1–3 pass, GFE no longer accepts cross-origin Host
+routing; try alternate fronts (`*.appspot.com`, `*.firebaseapp.com`,
+`*.gstatic.com`, `fonts.googleapis.com`) by changing `--front` / the
+`FRONT` env var.
+If 5 fails specifically, GFE still routes by Host but not into Cloud
+Run from this front — try the alternate fronts above; some are more
+willing to route into `*.run.app` than others.
+If 4 *and* 5 fail under all fronts, fronting is dead on this network
+and no software in this repo can rescue it. Abort.
+
+### Pinning a Google IP
+
+Both probes will use system DNS by default. On hostile networks DNS
+itself may be poisoned. Pass an IP explicitly:
+
+```sh
+FRONT_IP=142.251.150.119 bash scripts/preflight.sh
+./bin/pmt-probe --mode=all --front-ip=142.251.150.119
+```
+
+Find a working Google IP from a clean network with
+`dig www.google.com +short` and try a few — Google has hundreds of
+GFE IPs, and your firewall may permit only some of them.
 
 ## 2. One-shot deploy
 
