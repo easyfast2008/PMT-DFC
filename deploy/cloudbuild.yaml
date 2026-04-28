@@ -1,0 +1,61 @@
+# Cloud Build pipeline that builds the server image and deploys it to
+# Cloud Run with HTTP/2 enabled.
+#
+# Required substitutions (set via gcloud builds submit --substitutions=...,
+# or via a Cloud Build trigger):
+#
+#   _REGION       - e.g. us-central1
+#   _SERVICE      - e.g. pmt-tunnel
+#   _MIN_INSTANCES (optional, default 1)
+#   _MAX_INSTANCES (optional, default 4)
+#
+# The Cloud Run service must have the secret PMT_AUTH_KEY mounted as an
+# environment variable (Secret Manager reference). This pipeline does NOT
+# create the secret for you — see deploy/deploy.sh for the one-time
+# bootstrap.
+
+steps:
+  - id: build
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - --file=deploy/Dockerfile
+      - --tag=$_REGION-docker.pkg.dev/$PROJECT_ID/$_SERVICE/server:$SHORT_SHA
+      - .
+
+  - id: push
+    name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - $_REGION-docker.pkg.dev/$PROJECT_ID/$_SERVICE/server:$SHORT_SHA
+
+  - id: deploy
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - $_SERVICE
+      - --image=$_REGION-docker.pkg.dev/$PROJECT_ID/$_SERVICE/server:$SHORT_SHA
+      - --region=$_REGION
+      - --platform=managed
+      - --allow-unauthenticated
+      - --port=8080
+      - --use-http2
+      - --execution-environment=gen2
+      - --cpu=1
+      - --memory=512Mi
+      - --concurrency=200
+      - --timeout=3600
+      - --min-instances=${_MIN_INSTANCES}
+      - --max-instances=${_MAX_INSTANCES}
+      - --set-env-vars=PMT_LOG_LEVEL=info
+      - --set-secrets=PMT_AUTH_KEY=pmt-auth-key:latest
+      - --no-cpu-throttling
+
+substitutions:
+  _MIN_INSTANCES: "1"
+  _MAX_INSTANCES: "4"
+
+options:
+  logging: CLOUD_LOGGING_ONLY

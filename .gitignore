@@ -1,0 +1,10 @@
+bin/
+/pmt-server
+/pmt-client
+/pmt-probe
+*.log
+.DS_Store
+.idea/
+.vscode/
+*.local.json
+client.json

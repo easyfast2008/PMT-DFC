@@ -1,0 +1,11 @@
+{
+  "front_domain": "www.google.com",
+  "front_ip": "",
+  "front_port": 443,
+  "worker_host": "REPLACE-WITH-YOUR-CLOUD-RUN-HOST.run.app",
+  "tunnel_path": "/tunnel",
+  "auth_key": "REPLACE-WITH-PSK-AT-LEAST-16-BYTES",
+  "listen": "127.0.0.1:8085",
+  "log_level": "info",
+  "insecure_skip_verify": false
+}
