@@ -1,6 +1,7 @@
 {
+  "_comment": "Validated front IP (216.239.38.120) and SNI list as of writing — re-run scripts/preflight.sh sweep to refresh.",
   "front_domain": "www.google.com",
-  "front_ip": "",
+  "front_ip": "216.239.38.120",
   "front_port": 443,
   "worker_host": "REPLACE-WITH-YOUR-CLOUD-RUN-HOST.run.app",
   "tunnel_path": "/tunnel",
@@ -9,3 +10,4 @@
   "log_level": "info",
   "insecure_skip_verify": false
 }
+

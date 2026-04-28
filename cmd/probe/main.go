@@ -55,20 +55,45 @@ Modes:
              A 204 proves GFE still routes by Host across origins.
   runapp     Routing to *.run.app: SNI=--front, Host=<random>.run.app.
              A Cloud Run-style 404 proves Cloud Run is reachable via fronting.
-  all        Runs tcp → tls → front → cross → runapp.
+  all        Runs tcp → tls → front → cross → runapp for one --front.
+  sweep      Same as all, but iterates over multiple --front values
+             (comma-separated via --fronts=a,b,c). Prints a matrix.
   worker     Probes a real deployed worker (--worker host required).
 
 Examples:
-  pmt-probe --mode=all --front=www.google.com
-  pmt-probe --mode=all --front=www.google.com --front-ip=216.239.38.120
+  pmt-probe --mode=all   --front=www.google.com
+  pmt-probe --mode=all   --front=www.google.com --front-ip=216.239.38.120
+  pmt-probe --mode=sweep --front-ip=216.239.38.120 \
+            --fronts=www.google.com,mail.google.com,drive.google.com
   pmt-probe --mode=worker --front=www.google.com --worker=svc-abc.run.app
 
 `
 )
 
+// defaultSweepFronts is the list seeded from real-world deployments
+// (Google login subdomains tend to be permitted by most filtering
+// stacks because blocking them breaks Workspace, school accounts, etc.).
+// Override on the command line with --fronts.
+var defaultSweepFronts = []string{
+	"www.google.com",
+	"mail.google.com",
+	"drive.google.com",
+	"docs.google.com",
+	"calendar.google.com",
+	"accounts.google.com",
+	"scholar.google.com",
+	"maps.google.com",
+	"chat.google.com",
+	"translate.google.com",
+	"play.google.com",
+	"lens.google.com",
+	"chromewebstore.google.com",
+}
+
 func main() {
-	mode := flag.String("mode", "all", "tcp|tls|front|cross|runapp|worker|all")
+	mode := flag.String("mode", "all", "tcp|tls|front|cross|runapp|worker|all|sweep")
 	front := flag.String("front", "www.google.com", "front domain (SNI)")
+	fronts := flag.String("fronts", "", "comma-separated SNIs for mode=sweep (default: built-in list)")
 	frontIP := flag.String("front-ip", "", "fixed IP for the front (skip DNS); recommended on censored networks")
 	frontPort := flag.Int("front-port", 443, "front port")
 	worker := flag.String("worker", "", "worker host (Host header) — required for mode=worker")
@@ -121,6 +146,50 @@ func main() {
 			return testRunApp(*front, *frontIP, *frontPort, host, *timeout)
 		})
 		if any {
+			code = exitInterc
+		}
+	case "sweep":
+		list := defaultSweepFronts
+		if *fronts != "" {
+			list = splitCSV(*fronts)
+		}
+		results := make([]sweepRow, 0, len(list))
+		for _, sni := range list {
+			fmt.Printf("---- %s ----\n", sni)
+			row := sweepRow{sni: sni}
+			row.tcp = quiet(func() error { return testTCP(*frontIP, sni, *frontPort, *timeout) })
+			row.tls = quiet(func() error { return testTLS(sni, *frontIP, *frontPort, *timeout) })
+			row.front = quiet(func() error { return testHTTP(sni, *frontIP, *frontPort, sni, "/", -1, *timeout) })
+			row.cross = quiet(func() error {
+				return testHTTP(sni, *frontIP, *frontPort, "clients4.google.com", "/generate_204", 204, *timeout)
+			})
+			row.runapp = quiet(func() error {
+				return testRunApp(sni, *frontIP, *frontPort, randomRunApp(), *timeout)
+			})
+			results = append(results, row)
+		}
+		fmt.Println()
+		fmt.Println("---- sweep matrix ----")
+		fmt.Printf("%-30s  %-4s %-4s %-5s %-5s %-6s  %s\n", "SNI", "tcp", "tls", "front", "cross", "runapp", "verdict")
+		anyOK := false
+		for _, r := range results {
+			verdict := "FRONTING WORKS"
+			if r.cross != "" || r.runapp != "" {
+				verdict = "DO NOT USE"
+			}
+			if r.tcp != "" || r.tls != "" {
+				verdict = "BLOCKED"
+			}
+			if verdict == "FRONTING WORKS" {
+				anyOK = true
+			}
+			fmt.Printf("%-30s  %-4s %-4s %-5s %-5s %-6s  %s\n",
+				r.sni,
+				ok(r.tcp), ok(r.tls), ok(r.front), ok(r.cross), ok(r.runapp),
+				verdict,
+			)
+		}
+		if !anyOK {
 			code = exitInterc
 		}
 	default:
@@ -385,6 +454,38 @@ func (r *report) flush() {
 	for _, l := range r.lines {
 		fmt.Println(l)
 	}
+}
+
+type sweepRow struct {
+	sni                            string
+	tcp, tls, front, cross, runapp string // empty == pass; non-empty == error message
+}
+
+// quiet runs fn and returns the error message (or "" on success). Used by
+// the sweep mode so we don't double-print per-step results.
+func quiet(fn func() error) string {
+	if err := fn(); err != nil {
+		return err.Error()
+	}
+	return ""
+}
+
+func ok(s string) string {
+	if s == "" {
+		return "ok"
+	}
+	return "X"
+}
+
+func splitCSV(s string) []string {
+	out := []string{}
+	for _, p := range strings.Split(s, ",") {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func shorten(s string) string {

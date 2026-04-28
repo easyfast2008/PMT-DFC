@@ -59,44 +59,67 @@ the roadmap** — see review notes in the corresponding PR for reasoning.
 
 ### 0. Is this approach even feasible from MY network?
 
-Run **before** spending any time or money on Cloud Run. There are two
-ways, both equivalent — pick whichever runs on the censored machine:
+Run **before** spending any time or money on Cloud Run. Two equivalent
+ways — pick whichever runs on the censored machine:
 
 **(a) Bash + curl + openssl, no Go required:**
 
 ```sh
-bash scripts/preflight.sh
-# or, with a pinned IP if DNS is hostile on your network:
-FRONT_IP=142.251.150.119 bash scripts/preflight.sh
+# single front, against a pinned IP (recommended on hostile DNS):
+FRONT_IP=216.239.38.120 FRONT=www.google.com bash scripts/preflight.sh
+
+# matrix sweep across all default Google login subdomains on one IP:
+FRONT_IP=216.239.38.120 bash scripts/preflight.sh sweep
 ```
 
-**(b) Single Go binary (use this if you can copy `pmt-probe` over):**
+**(b) Single Go binary:**
 
 ```sh
 make probe
-./bin/pmt-probe --mode=all --front=www.google.com
-# pinned IP variant:
-./bin/pmt-probe --mode=all --front=www.google.com --front-ip=142.251.150.119
+./bin/pmt-probe --mode=all   --front=www.google.com --front-ip=216.239.38.120
+./bin/pmt-probe --mode=sweep --front-ip=216.239.38.120
 ```
 
-Both run the same five-step feasibility battery and require zero GCP
-infrastructure:
+Both run the same five-step battery; `sweep` repeats it across many
+SNIs sharing one IP and prints a per-SNI verdict matrix. Neither
+mode requires you to deploy anything to GCP.
 
 | # | Test | What it proves |
 |---|------|---------------|
-| 1 | TCP `443` to a Google IP | Your firewall lets you reach Google at all. |
-| 2 | TLS handshake, SNI=front, ALPN=h2 | No TLS MITM by your firewall. |
-| 3 | HTTPS GET `https://www.google.com/` | The front itself is reachable end-to-end. |
-| 4 | SNI=front, **Host=`clients4.google.com`**, `GET /generate_204` → expect **204** | GFE still routes by `Host` header across origins. |
-| 5 | SNI=front, **Host=`nonexistent-<rand>-uc.a.run.app`**, `GET /` → expect **Cloud Run-style 404** | GFE will route a fronted request to Cloud Run specifically. |
+| 1 | TCP `443` to the front IP | Your firewall lets you reach Google at all. |
+| 2 | TLS handshake, SNI=front, ALPN=h2 hinted | No TLS MITM by your firewall. |
+| 3 | HTTPS GET `https://<front>/` | The front itself is reachable end-to-end. |
+| 4 | SNI=front, **Host=`clients4.google.com`**, `GET /generate_204` → **204** | GFE still routes by `Host` header across origins. |
+| 5 | SNI=front, **Host=`nonexistent-<rand>-uc.a.run.app`**, `GET /` → **Cloud Run-style 4xx** | GFE will route a fronted request to Cloud Run specifically. |
 
-If all five PASS: deploy with confidence. If step 4 or 5 fails: GFE no
-longer accepts the SNI/Host split for that path — you can try alternate
-fronts (`*.appspot.com`, `*.firebaseapp.com`, `*.gstatic.com`,
-`fonts.googleapis.com`) by changing `--front` / `FRONT`. If none work,
-domain fronting on Google's infrastructure is broken on your network
-and **no software change in this repo can fix that** — abort and
-reconsider the approach.
+The default SNI list for `sweep` (validated working through GFE IP
+`216.239.38.120` as of writing — re-run sweep periodically to refresh):
+
+```
+www.google.com           mail.google.com         drive.google.com
+docs.google.com          calendar.google.com     accounts.google.com
+scholar.google.com       maps.google.com         chat.google.com
+translate.google.com     play.google.com         lens.google.com
+chromewebstore.google.com
+```
+
+These subdomains are picked deliberately: they're on Google's login
+critical path (Workspace, Search, Drive), so most filtering stacks
+permit them — blocking them breaks too much legitimate traffic.
+
+If at least one row in the sweep is `FRONTING WORKS`, deploy with
+confidence using that SNI. If all rows are `DO NOT USE` (steps 1–3
+pass but 4 and/or 5 fail), GFE no longer routes fronted traffic for
+that IP — try a different Google IP, or alternate front families
+(`*.appspot.com`, `*.firebaseapp.com`, `*.gstatic.com`, `fonts.googleapis.com`).
+If all rows are `BLOCKED`, your firewall isn't even letting TLS to
+that IP through — switch to a different Google IP.
+
+If nothing works under any combination, domain fronting on Google's
+infrastructure is broken on your network and **no software change in
+this repo can fix that**. Abort and consider non-fronted alternatives
+(Trojan-Go, Xray-VLESS-Reality, hysteria2 on a clean datacenter or
+residential VPS).
 
 ### 1. Build the binaries
 
